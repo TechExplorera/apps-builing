@@ -1,12 +1,15 @@
+
+
 name: Build from ZIP URL
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "URL directa del .zip (Drive, Dropbox, Mega, GitHub, etc.)"
+        description: "URL directa de descarga del archivo ZIP"
         required: true
         type: string
+
       build_type:
         description: "Tipo de proyecto"
         required: true
@@ -19,119 +22,321 @@ on:
           - make
           - c-simple
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-from-zip-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
     steps:
-      - name: Descargar el ZIP
+      # ---------- DEPENDENCIAS ----------
+      - name: Instalar herramientas
         run: |
-          mkdir -p work && cd work
-          URL="${{ inputs.zip_url }}"
-          # Dropbox: forzar descarga directa
-          URL="${URL/dl=0/dl=1}"
-          # Google Drive: soporte para enlaces /file/d/ID/
-          if [[ "$URL" == *"drive.google.com/file/d/"* ]]; then
-            ID=$(echo "$URL" | sed -E 's#.*/file/d/([^/]+).*#\1#')
-            pip install -q gdown
-            gdown "https://drive.google.com/uc?id=$ID" -O project.zip
-          else
-            curl -L --fail --retry 3 -o project.zip "$URL"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            make \
+            gcc \
+            g++ \
+            curl \
+            file \
+            unzip \
+            zip
+
+      # ---------- DESCARGAR ZIP ----------
+      - name: Descargar el ZIP
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p work
+          cd work
+
+          URL="$ZIP_URL"
+
+          if [[ ! "$URL" =~ ^https?:// ]]; then
+            echo "::error::La URL debe comenzar con http:// o https://"
+            exit 1
           fi
+
+          # Convierte enlaces compartidos de Dropbox
+          # que terminan en dl=0 a dl=1.
+          URL="${URL/dl=0/dl=1}"
+
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            --user-agent "Mozilla/5.0" \
+            --output project.zip \
+            "$URL"
+
+          if [ ! -s project.zip ]; then
+            echo "::error::El archivo descargado está vacío."
+            exit 1
+          fi
+
+          echo "Información del archivo:"
+          file project.zip
           ls -lh project.zip
 
-      - name: Extraer
-        run: |
-          cd work
-          unzip -q project.zip -d src
-          # Si el zip trae una sola carpeta raíz, entrar en ella
-          COUNT=$(ls -1 src | wc -l)
-          if [ "$COUNT" -eq 1 ] && [ -d "src/$(ls -1 src)" ]; then
-            mv "src/$(ls -1 src)" proj
-          else
-            mv src proj
+          if ! unzip -tq project.zip; then
+            echo "::error::La URL no devolvió un ZIP válido."
+            echo "Comprueba que sea una URL de descarga directa."
+            exit 1
           fi
-          ls proj
 
+      # ---------- EXTRAER ----------
+      - name: Extraer proyecto
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p work/src
+          unzip -q work/project.zip -d work/src
+
+          # Detectar una única carpeta raíz.
+          shopt -s dotglob nullglob
+          entries=(work/src/*)
+
+          if [ "${#entries[@]}" -eq 1 ] &&
+             [ -d "${entries[0]}" ]; then
+            mv "${entries[0]}" work/proj
+          else
+            mv work/src work/proj
+          fi
+
+          echo "Contenido del proyecto:"
+          find work/proj -maxdepth 2 -type f | head -100
+
+      # ---------- DETECTAR TIPO ----------
       - name: Detectar tipo de proyecto
         id: detect
+        env:
+          REQUESTED_TYPE: ${{ inputs.build_type }}
         run: |
+          set -Eeuo pipefail
+
           cd work/proj
-          T="${{ inputs.build_type }}"
+          T="$REQUESTED_TYPE"
+
           if [ "$T" = "auto" ]; then
-            if [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then T=android-gradle
-            elif [ -f CMakeLists.txt ]; then T=cmake
-            elif [ -f Makefile ]; then T=make
-            else T=c-simple
+            if [ -f gradlew ] ||
+               [ -f build.gradle ] ||
+               [ -f build.gradle.kts ]; then
+              T=android-gradle
+            elif [ -f CMakeLists.txt ]; then
+              T=cmake
+            elif [ -f Makefile ] || [ -f makefile ]; then
+              T=make
+            elif find . -maxdepth 2 -type f \
+                 \( -name '*.c' -o -name '*.cc' \
+                    -o -name '*.cpp' -o -name '*.cxx' \) \
+                 -print -quit | grep -q .; then
+              T=c-simple
+            else
+              echo "::error::No se pudo detectar el tipo de proyecto."
+              exit 1
             fi
           fi
-          echo "type=$T" >> "$GITHUB_OUTPUT"
-          echo "Tipo detectado: $T"
 
-      # ---------- ANDROID ----------
-      - uses: actions/setup-java@v4
+          echo "type=$T" >> "$GITHUB_OUTPUT"
+          echo "Tipo seleccionado: $T"
+
+      # ---------- JAVA ----------
+      - name: Configurar Java
         if: steps.detect.outputs.type == 'android-gradle'
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
+          cache: gradle
 
-      - uses: android-actions/setup-android@v3
+      # ---------- ANDROID SDK ----------
+      - name: Configurar Android SDK
         if: steps.detect.outputs.type == 'android-gradle'
+        uses: android-actions/setup-android@v3
 
-      - name: Compilar Android (APK)
+      # ---------- COMPILAR ANDROID ----------
+      - name: Compilar Android APK
         if: steps.detect.outputs.type == 'android-gradle'
         run: |
+          set -Eeuo pipefail
           cd work/proj
-          if [ ! -f gradlew ]; then
-            sudo apt-get install -y gradle
-            gradle assembleDebug
-          else
+
+          if [ -f gradlew ]; then
             chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon
+            ./gradlew \
+              --no-daemon \
+              --stacktrace \
+              assembleDebug
+          elif [ -f build.gradle ] ||
+               [ -f build.gradle.kts ]; then
+            gradle --version >/dev/null 2>&1 || {
+              sudo apt-get install -y gradle
+            }
+
+            gradle \
+              --no-daemon \
+              --stacktrace \
+              assembleDebug
+          else
+            echo "::error::No se encontró un proyecto Gradle en la raíz."
+            exit 1
           fi
 
       # ---------- CMAKE ----------
       - name: Compilar CMake
         if: steps.detect.outputs.type == 'cmake'
         run: |
+          set -Eeuo pipefail
           cd work/proj
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+
+          cmake \
+            -S . \
+            -B build \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build build \
+            --config Release \
+            --parallel "$(nproc)"
 
       # ---------- MAKE ----------
       - name: Compilar Make
         if: steps.detect.outputs.type == 'make'
         run: |
+          set -Eeuo pipefail
           cd work/proj
+
           make -j"$(nproc)"
 
-      # ---------- C SIMPLE ----------
-      - name: Compilar C simple
+      # ---------- C / C++ INDEPENDIENTES ----------
+      - name: Compilar C y C++
         if: steps.detect.outputs.type == 'c-simple'
         run: |
+          set -Eeuo pipefail
           cd work/proj
-          mkdir -p out
-          for f in *.c; do
-            [ -f "$f" ] && gcc -O2 -Wall "$f" -o "out/${f%.c}"
-          done
 
-      # ---------- SUBIR RESULTADOS ----------
+          mkdir -p out
+          count=0
+
+          while IFS= read -r -d '' src; do
+            rel="${src#./}"
+            name="${rel%.*}"
+            name="${name//\//_}"
+
+            case "$src" in
+              *.c)
+                compiler=gcc
+                ;;
+              *.cc|*.cpp|*.cxx)
+                compiler=g++
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            echo "Compilando: $src"
+
+            "$compiler" \
+              -O2 \
+              -Wall \
+              -Wextra \
+              "$src" \
+              -o "out/$name"
+
+            count=$((count + 1))
+          done < <(
+            find . \
+              -type d \( \
+                -name .git -o \
+                -name build -o \
+                -name out \
+              \) -prune -o \
+              -type f \( \
+                -name '*.c' -o \
+                -name '*.cc' -o \
+                -name '*.cpp' -o \
+                -name '*.cxx' \
+              \) -print0
+          )
+
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No se encontraron archivos C/C++."
+            exit 1
+          fi
+
+          echo "Archivos compilados: $count"
+
+      # ---------- REUNIR RESULTADOS ----------
       - name: Reunir resultados
+        if: always() && steps.detect.outputs.type != ''
         run: |
+          set -Eeuo pipefail
+
           mkdir -p result
           cd work/proj
-          find . \( -name "*.apk" -o -name "*.aab" -o -name "*.so" \) \
-            -not -path "*/intermediates/*" -exec cp --parents {} ../../result/ \; || true
-          [ -d out ] && cp -r out ../../result/ || true
-          [ -d build ] && find build -maxdepth 2 -type f -executable \
-            -exec cp --parents {} ../../result/ \; || true
-          find ../../result -type f
 
-      - name: Subir artefactos
+          # APK, AAB y bibliotecas compartidas.
+          while IFS= read -r -d '' f; do
+            dest="../../result/$f"
+            mkdir -p "$(dirname "$dest")"
+            cp -p "$f" "$dest"
+          done < <(
+            find . \
+              -type d \( \
+                -name .git -o \
+                -name .gradle \
+              \) -prune -o \
+              -type f \( \
+                -name '*.apk' -o \
+                -name '*.aab' -o \
+                -name '*.so' \
+              \) -print0
+          )
+
+          # Ejecutables de C/C++.
+          if [ -d out ]; then
+            mkdir -p ../../result/native
+            cp -a out/. ../../result/native/
+          fi
+
+          # Ejecutables generados en la carpeta build de CMake.
+          if [ -d build ]; then
+            while IFS= read -r -d '' f; do
+              dest="../../result/cmake/${f#build/}"
+              mkdir -p "$(dirname "$dest")"
+              cp -p "$f" "$dest"
+            done < <(
+              find build -type f -executable -print0
+            )
+          fi
+
+          echo "Artefactos recopilados:"
+          find ../../result -type f -print || true
+
+      # ---------- SUBIR ARTEFACTOS ----------
+      - name: Subir resultados
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-output
           path: result/
           if-no-files-found: warn
-          
+          retention-days: 7
